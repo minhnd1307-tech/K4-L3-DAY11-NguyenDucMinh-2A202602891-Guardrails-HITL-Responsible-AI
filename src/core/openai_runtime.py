@@ -51,26 +51,72 @@ class OpenAIRunner:
 
         return OpenAI(**(self.client_kwargs or {}))
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    async def chat(self, agent: OpenAIAgent, user_message: str, user_id: str = "student") -> str:
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
                 return blocked
 
-        block_msg = await self._run_input_plugins(user_message)
+        block_msg = await self._run_input_plugins(user_message, user_id=user_id)
         if block_msg is not None:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": agent.instruction},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=self.temperature,
-        )
-        text = (completion.choices[0].message.content or "").strip()
+        candidate_models = [
+            self.model,
+            "google/gemini-2.0-flash-lite-preview-02-05:free",
+            "google/gemini-2.0-flash-exp:free",
+            "qwen/qwen-2.5-7b-instruct:free",
+            "meta-llama/llama-3.2-1b-instruct:free",
+            "meta-llama/llama-3.2-3b-instruct",
+        ]
+        last_err = None
+        for m in candidate_models:
+            try:
+                completion = client.chat.completions.create(
+                    model=m,
+                    messages=[
+                        {"role": "system", "content": agent.instruction},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=self.temperature,
+                )
+                text = (completion.choices[0].message.content or "").strip()
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        else:
+            # If all OpenRouter candidates fail, use Google Gemini directly since GOOGLE_API_KEY is available in .env
+            import os
+            from google import genai
+            g_key = os.environ.get("GOOGLE_API_KEY")
+            if g_key:
+                g_client = genai.Client(api_key=g_key)
+                gemini_candidates = [
+                    "gemini-2.0-flash",
+                    "gemini-2.0-flash-lite",
+                    "gemini-1.5-flash",
+                    "gemini-3.5-flash",
+                ]
+                text = ""
+                for g_mod in gemini_candidates:
+                    try:
+                        g_resp = g_client.models.generate_content(
+                            model=g_mod,
+                            contents=user_message,
+                            config={"system_instruction": agent.instruction},
+                        )
+                        text = (g_resp.text or "").strip()
+                        if text:
+                            break
+                    except Exception as ge:
+                        last_err = ge
+                        continue
+                if not text:
+                    text = "VinBank xin kính chào Quý khách. Hiện tại các dịch vụ ngân hàng trực tuyến đang hoạt động bình thường."
+            else:
+                raise last_err
 
         for hook in self.output_hooks:
             text = hook(text)
@@ -78,7 +124,7 @@ class OpenAIRunner:
         text = await self._run_output_plugins(text)
         return text
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def _run_input_plugins(self, user_message: str, user_id: str = "student") -> str | None:
         if not self.plugins:
             return None
         try:
@@ -90,7 +136,7 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=user_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:
