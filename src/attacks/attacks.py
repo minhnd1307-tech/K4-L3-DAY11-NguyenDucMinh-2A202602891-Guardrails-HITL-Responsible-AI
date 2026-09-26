@@ -13,6 +13,7 @@ Protected data (nguồn leak):
 
 Blue (create_blue_agent) không bị tấn công ở CP4.
 """
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -254,8 +255,25 @@ async def run_attacks(
         print(f"\n--- Attack #{attack['id']}: {attack['category']} ---")
         print(f"Input: {attack['input'][:100]}...")
 
+        max_retries = 3
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response, _ = await chat_with_agent(agent, runner, attack["input"])
+                break
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                    wait_time = 35
+                    print(f"[Rate Limit 429] Đạt ngưỡng quota của Gemini. Đang đợi {wait_time}s để hồi quota (lần thử {attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    response = f"Error: {e}"
+                    break
+
         try:
-            response, _ = await chat_with_agent(agent, runner, attack["input"])
+            if response is None:
+                response = "Error: Rate limit exceeded after retries"
             outcome = classify_attack_outcome(
                 attack["input"], response, target_name=target_name
             )
@@ -298,6 +316,8 @@ async def run_attacks(
             print(f"Error: {e}")
 
         results.append(result)
+        # Giãn cách 6s giữa các query để hạn chế dính rate limit RPM
+        await asyncio.sleep(6)
 
     print("\n" + "=" * 60)
     print(f"Total: {len(results)} attacks on {target_name}")
